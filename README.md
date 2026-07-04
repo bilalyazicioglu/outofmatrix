@@ -18,7 +18,8 @@ internal/delivery/http chi router, handlers, middleware
 internal/worker/       bounded worker pool (channel-based job queue)
 pkg/ffmpeg/            standalone ffmpeg/ffprobe wrapper
 migrations/            SQL schema
-web/                   single-file demo client (HTML5 + hls.js)
+web/                   frontend source (Vite + React + TypeScript + shadcn/ui)
+static/                built frontend assets, served by the Go binary (generated)
 ```
 
 The media pipeline: chunked resumable upload → chunks written at their exact
@@ -41,15 +42,30 @@ Open http://localhost:8080 — register an account, upload media, play it.
 The schema in `migrations/` is applied automatically on the first boot of a
 fresh database volume.
 
+## Frontend
+
+The UI in `web/` is a Vite + React + TypeScript app built on shadcn/ui
+(Radix primitives, Tailwind CSS v4, self-hosted Geist font): drag-and-drop
+resumable uploads with live per-byte progress, WebSocket-driven processing
+overlays on each card, BlurHash placeholders decoded client-side, and an
+hls.js player that is lazy-loaded only when the first video is opened —
+everything else ships as one ~120 KB gzipped bundle. `npm run build` emits
+hashed assets into `static/`, which the Go server serves with
+`immutable` cache headers (and `no-cache` for `index.html`).
+
 ## Run locally
 
-Requires Go 1.22+, PostgreSQL and ffmpeg/ffprobe on PATH.
+Requires Go 1.22+, Node 20+, PostgreSQL and ffmpeg/ffprobe on PATH.
 
 ```sh
 make db-up                 # start Postgres in Docker (schema auto-applied)
 cp .env.example .env       # adjust if needed; export the variables
+make web                   # build the frontend into static/
 make run
 ```
+
+For frontend work, `make web-dev` starts Vite on :5173 with hot reload,
+proxying `/api` (including the WebSocket) to the Go server on :8080.
 
 ## API
 

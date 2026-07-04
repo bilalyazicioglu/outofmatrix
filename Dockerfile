@@ -1,4 +1,18 @@
 # ---------------------------------------------------------------------------
+# Frontend stage: Vite + React + shadcn/ui → static assets
+# ---------------------------------------------------------------------------
+FROM node:22-alpine AS webbuild
+
+WORKDIR /web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+
+COPY web/ ./
+# vite.config.ts outputs to ../static, i.e. /static in this stage.
+RUN npm run build
+
+# ---------------------------------------------------------------------------
 # Build stage: static binary, no CGO
 # ---------------------------------------------------------------------------
 FROM golang:1.24-alpine AS build
@@ -24,7 +38,7 @@ RUN apk add --no-cache ffmpeg ca-certificates tzdata \
     && chown -R app:app /data/media
 
 COPY --from=build /out/server /usr/local/bin/server
-COPY --chown=app:app static /app/static
+COPY --from=webbuild --chown=app:app /static /app/static
 
 USER app
 WORKDIR /app

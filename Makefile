@@ -1,10 +1,18 @@
-.PHONY: build run tidy vet db-up db-down docker-up docker-down
+.PHONY: build run tidy vet web web-dev db-up db-down docker-up docker-down
 
 build:
 	go build -o bin/server ./cmd/server
 
+# Serves whatever is currently in static/ — run `make web` after frontend changes.
 run: build
 	./bin/server
+
+web:
+	cd web && npm install && npm run build
+
+# Vite dev server on :5173 with hot reload; proxies /api and /ws to :8080.
+web-dev:
+	cd web && npm install && npm run dev
 
 tidy:
 	go mod tidy

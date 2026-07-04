@@ -5,6 +5,7 @@ package http
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -97,10 +98,19 @@ func NewRouter(d RouterDeps) http.Handler {
 		})
 	})
 
-	// Static frontend (static/index.html) at the root.
+	// Static frontend (the Vite build in static/) at the root. Vite emits
+	// content-hashed filenames under /assets/, so those are safe to cache
+	// forever; index.html must always be revalidated so new deploys land.
 	if d.WebDir != "" {
 		fs := http.FileServer(http.Dir(d.WebDir))
-		r.Handle("/*", fs)
+		r.Handle("/*", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if strings.HasPrefix(req.URL.Path, "/assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
+			fs.ServeHTTP(w, req)
+		}))
 	}
 
 	return r

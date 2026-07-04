@@ -1,5 +1,8 @@
 data/
 bin/
+static/
+web/node_modules/
+web/dist/
 .env
 .git/
 .claude/
