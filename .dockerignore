@@ -1,0 +1,9 @@
+data/
+bin/
+.env
+.git/
+.claude/
+*.log
+.DS_Store
+docker-compose.yml
+Dockerfile

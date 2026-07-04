@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>outofmatrix — personal media cloud</title>
+<!--
+  Frontend for the outofmatrix Go API.
+
+  How this client talks to the backend:
+    1. POST /api/v1/auth/register | /login          -> JWT (localStorage)
+    2. Chunked resumable upload:
+         POST /api/v1/uploads                        -> session {id, chunk_size, total_chunks}
+         PUT  /api/v1/uploads/{id}/chunks/{index}    -> raw 8 MiB slices, streamed
+         GET  /api/v1/uploads/{id}                   -> received chunks (resume)
+         POST /api/v1/uploads/{id}/complete          -> MediaItem, queued for processing
+    3. WS /api/v1/ws?token=...                       -> {media_id,status,stage,progress}
+       drives the per-item progress bars in real time
+    4. Playback:
+         video -> hls.js on /api/v1/media/stream/{id}/master.m3u8 (adaptive 1080p/720p)
+         audio -> range requests on /api/v1/media/raw/{id}
+         photo -> /api/v1/media/raw/{id} rendered with object-contain (no distortion)
+-->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: "class" };</script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<style>
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+</style>
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen font-sans">
+<div class="max-w-6xl mx-auto px-4 py-6 pb-24">
+
+  <header class="flex items-center justify-between mb-6">
+    <h1 class="text-xl font-bold tracking-tight">out<span class="text-indigo-400">of</span>matrix</h1>
+    <div class="flex items-center gap-3 text-sm">
+      <span id="wsDot" class="w-2 h-2 rounded-full bg-slate-600" title="WebSocket"></span>
+      <span id="whoami" class="text-slate-400"></span>
+      <button id="logoutBtn" class="hidden text-slate-400 hover:text-slate-200 border border-slate-700 rounded-lg px-3 py-1.5">Log out</button>
+    </div>
+  </header>
+
+  <!-- ── Auth ─────────────────────────────────────────────────────────── -->
+  <section id="authPanel" class="bg-slate-900 border border-slate-800 rounded-2xl p-5 mb-6">
+    <div class="flex flex-wrap gap-2 items-center">
+      <input id="username" placeholder="username" autocomplete="username"
+             class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+      <input id="password" type="password" placeholder="password (min 8)" autocomplete="current-password"
+             class="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-500">
+      <button id="loginBtn" class="bg-indigo-600 hover:bg-indigo-500 rounded-lg px-4 py-2 text-sm font-medium">Log in</button>
+      <button id="registerBtn" class="border border-slate-700 hover:border-slate-500 rounded-lg px-4 py-2 text-sm text-slate-300">Register</button>
+    </div>
+    <p id="authError" class="text-rose-400 text-sm mt-2 min-h-[1.25rem]"></p>
+  </section>
+
+  <!-- ── Upload zone ──────────────────────────────────────────────────── -->
+  <section id="uploadPanel" class="hidden mb-6">
+    <div id="dropZone"
+         class="border-2 border-dashed border-slate-700 rounded-2xl p-10 text-center cursor-pointer transition-colors hover:border-indigo-500/70 bg-slate-900/50">
+      <p class="text-3xl mb-2">⬆️</p>
+      <p class="font-medium">Drag &amp; drop media here</p>
+      <p class="text-sm text-slate-400 mt-1">or click to browse — video, audio and photos.
+        Large files upload in resumable 8&nbsp;MB chunks.</p>
+      <input id="fileInput" type="file" multiple accept="video/*,audio/*,image/*" class="hidden">
+    </div>
+    <div id="uploadList" class="mt-4 space-y-2"></div>
+  </section>
+
+  <!-- ── Library ──────────────────────────────────────────────────────── -->
+  <section id="libraryPanel" class="hidden">
+    <div class="flex items-center justify-between mb-4">
+      <div class="flex gap-2 items-center">
+        <select id="typeFilter" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm">
+          <option value="">All media</option>
+          <option value="video">Videos</option>
+          <option value="audio">Audio</option>
+          <option value="photo">Photos</option>
+        </select>
+        <button id="refreshBtn" class="border border-slate-700 hover:border-slate-500 rounded-lg px-3 py-2 text-sm text-slate-300">Refresh</button>
+      </div>
+      <span id="libraryCount" class="text-sm text-slate-400"></span>
+    </div>
+    <div id="grid" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4"></div>
+  </section>
+</div>
+
+<!-- ── Player modal ───────────────────────────────────────────────────── -->
+<div id="playerModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+  <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-4xl overflow-hidden shadow-2xl">
+    <div class="flex items-center justify-between px-5 py-3 border-b border-slate-800">
+      <h3 id="playerTitle" class="font-medium truncate"></h3>
+      <button id="closePlayer" class="text-slate-400 hover:text-white text-xl leading-none px-2">&times;</button>
+    </div>
+    <!-- Media renders with object-contain inside a fixed-height stage, so
+         photos and videos keep their true aspect ratio at every size. -->
+    <div id="playerBody" class="bg-black flex items-center justify-center min-h-[200px] max-h-[70vh]"></div>
+    <div id="playerInfo" class="px-5 py-3 text-xs text-slate-400"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const API = "/api/v1";
+const CHUNK_RETRIES = 3;
+
+let token = localStorage.getItem("omx_token") || "";
+let user  = JSON.parse(localStorage.getItem("omx_user") || "null");
+let socket = null;
+let hls = null;
+
+const $ = (id) => document.getElementById(id);
+
+/* ── API helper ────────────────────────────────────────────────────── */
+async function api(path, options = {}) {
+  const headers = Object.assign({}, options.headers);
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(API + path, Object.assign({}, options, { headers }));
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 401 && token) logout();
+    throw new Error(body.error || ("HTTP " + res.status));
+  }
+  return body;
+}
+
+/* ── Auth ──────────────────────────────────────────────────────────── */
+async function login() {
+  const out = await api("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: $("username").value.trim(), password: $("password").value }),
+  });
+  token = out.token; user = out.user;
+  localStorage.setItem("omx_token", token);
+  localStorage.setItem("omx_user", JSON.stringify(user));
+  render(); connectWS(); loadLibrary();
+}
+
+async function register() {
+  await api("/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: $("username").value.trim(), password: $("password").value }),
+  });
+  await login();
+}
+
+function logout() {
+  token = ""; user = null;
+  localStorage.removeItem("omx_token");
+  localStorage.removeItem("omx_user");
+  if (socket) { socket.onclose = null; socket.close(); socket = null; }
+  closePlayer(); render();
+}
+
+/* ── WebSocket: real-time pipeline events ──────────────────────────── */
+function connectWS() {
+  if (!token || socket) return;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${proto}://${location.host}${API}/ws?token=${encodeURIComponent(token)}`);
+
+  socket.onopen = () => $("wsDot").className = "w-2 h-2 rounded-full bg-emerald-400";
+  socket.onmessage = (e) => {
+    try { applyEvent(JSON.parse(e.data)); } catch {}
+  };
+  socket.onclose = () => {
+    $("wsDot").className = "w-2 h-2 rounded-full bg-slate-600";
+    socket = null;
+    if (token) setTimeout(connectWS, 3000); // auto-reconnect
+  };
+}
+
+// Events: {media_id, title, type, status: queued|processing|completed|failed,
+//          stage, progress: 0-100, error}
+function applyEvent(evt) {
+  const card = document.querySelector(`[data-media-id="${evt.media_id}"]`);
+  if (!card) { loadLibrary(); return; } // new item we haven't rendered yet
+
+  const bar   = card.querySelector(".js-bar");
+  const label = card.querySelector(".js-status");
+  const veil  = card.querySelector(".js-veil");
+
+  if (evt.status === "completed") {
+    loadLibrary(); // pick up thumbnail, metadata, ready state
+    return;
+  }
+  if (evt.status === "failed") {
+    veil.classList.remove("hidden");
+    bar.parentElement.classList.add("hidden");
+    label.textContent = "failed";
+    label.className = "js-status text-rose-400 text-xs font-medium";
+    return;
+  }
+  veil.classList.remove("hidden");
+  bar.parentElement.classList.remove("hidden");
+  bar.style.width = Math.max(2, evt.progress).toFixed(1) + "%";
+  label.textContent = evt.status === "queued"
+    ? "queued"
+    : `${evt.stage || "processing"} ${Math.round(evt.progress)}%`;
+}
+
+/* ── Resumable chunked upload ──────────────────────────────────────── */
+function handleFiles(fileList) {
+  [...fileList].forEach((file) => uploadFile(file).catch((err) => {
+    const row = document.querySelector(`[data-upload-name="${CSS.escape(file.name)}"] .js-upstatus`);
+    if (row) { row.textContent = "error: " + err.message; row.classList.add("text-rose-400"); }
+  }));
+}
+
+async function uploadFile(file) {
+  const row = uploadRow(file.name);
+
+  // 1. Open a session; the server dictates chunk size and count.
+  const sess = await api("/uploads", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: file.name, size: file.size, mime_type: file.type }),
+  });
+
+  // 2. Send every chunk the server doesn't have yet (fresh session: none).
+  const have = new Set(sess.received_chunks);
+  let doneBytes = have.size * sess.chunk_size;
+  for (let i = 0; i < sess.total_chunks; i++) {
+    if (have.has(i)) continue;
+    const start = i * sess.chunk_size;
+    const blob = file.slice(start, Math.min(file.size, start + sess.chunk_size));
+    await putChunkWithRetry(sess.id, i, blob, (loaded) => {
+      row.progress(((doneBytes + loaded) / file.size) * 100, "uploading");
+    });
+    doneBytes += blob.size;
+  }
+
+  // 3. Assemble server-side; processing status now arrives over WebSocket.
+  row.progress(100, "finalizing");
+  await api(`/uploads/${sess.id}/complete`, { method: "POST" });
+  row.done();
+  loadLibrary();
+}
+
+function putChunkWithRetry(sessionID, index, blob, onProgress) {
+  let attempt = 0;
+  const tryOnce = () => putChunk(sessionID, index, blob, onProgress).catch((err) => {
+    if (++attempt >= CHUNK_RETRIES) throw err;
+    return new Promise((r) => setTimeout(r, 1000 * attempt)).then(tryOnce);
+  });
+  return tryOnce();
+}
+
+// XHR instead of fetch purely for byte-level upload progress events.
+function putChunk(sessionID, index, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", `${API}/uploads/${sessionID}/chunks/${index}`);
+    xhr.setRequestHeader("Authorization", "Bearer " + token);
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
+    xhr.onload = () => xhr.status === 204
+      ? resolve()
+      : reject(new Error(`chunk ${index}: HTTP ${xhr.status}`));
+    xhr.onerror = () => reject(new Error(`chunk ${index}: network error`));
+    xhr.send(blob);
+  });
+}
+
+function uploadRow(name) {
+  const el = document.createElement("div");
+  el.dataset.uploadName = name;
+  el.className = "bg-slate-900 border border-slate-800 rounded-xl px-4 py-3";
+  el.innerHTML = `
+    <div class="flex justify-between text-sm mb-2">
+      <span class="truncate mr-3">${escapeHtml(name)}</span>
+      <span class="js-upstatus text-slate-400 shrink-0">starting…</span>
+    </div>
+    <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+      <div class="js-upbar h-full bg-indigo-500 transition-all duration-200" style="width:0%"></div>
+    </div>`;
+  $("uploadList").prepend(el);
+  return {
+    progress(pct, label) {
+      el.querySelector(".js-upbar").style.width = pct.toFixed(1) + "%";
+      el.querySelector(".js-upstatus").textContent = `${label} ${Math.round(pct)}%`;
+    },
+    done() { setTimeout(() => el.remove(), 1500); },
+  };
+}
+
+/* ── Library ───────────────────────────────────────────────────────── */
+async function loadLibrary() {
+  if (!token) return;
+  const qs = new URLSearchParams({ limit: "100" });
+  if ($("typeFilter").value) qs.set("type", $("typeFilter").value);
+
+  let out;
+  try { out = await api("/media?" + qs); } catch { return; }
+
+  $("libraryCount").textContent = `${out.total} item(s)`;
+  const grid = $("grid");
+  grid.innerHTML = "";
+  out.items.forEach((item) => grid.appendChild(card(item)));
+}
+
+function card(item) {
+  const busy = item.status === "pending" || item.status === "processing";
+  const failed = item.status === "failed";
+  const icon = { video: "🎬", audio: "🎵", photo: "🖼️" }[item.type] || "📄";
+  const thumb = item.thumbnail_path
+    ? `<img src="${API}/media/thumb/${item.id}?token=${encodeURIComponent(token)}"
+           class="w-full h-full object-cover" loading="lazy" alt="">`
+    : `<span class="text-4xl">${icon}</span>`;
+
+  const el = document.createElement("div");
+  el.dataset.mediaId = item.id;
+  el.className = "bg-slate-900 border border-slate-800 rounded-xl overflow-hidden group " +
+    (item.status === "ready" ? "cursor-pointer hover:border-indigo-500/60" : "");
+  el.innerHTML = `
+    <div class="relative aspect-video bg-slate-950 flex items-center justify-center overflow-hidden">
+      ${thumb}
+      <div class="js-veil ${busy || failed ? "" : "hidden"} absolute inset-0 bg-black/60 flex flex-col items-center justify-center gap-2 px-4">
+        <span class="js-status text-xs font-medium ${failed ? "text-rose-400" : "text-slate-200"}">
+          ${failed ? "failed" : item.status}
+        </span>
+        <div class="w-full h-1.5 bg-slate-700 rounded-full overflow-hidden ${busy ? "" : "hidden"}">
+          <div class="js-bar h-full bg-indigo-500 transition-all duration-300" style="width:2%"></div>
+        </div>
+      </div>
+      ${item.metadata?.duration_seconds
+        ? `<span class="absolute bottom-1.5 right-1.5 bg-black/70 text-[11px] px-1.5 py-0.5 rounded">${fmtDuration(item.metadata.duration_seconds)}</span>`
+        : ""}
+    </div>
+    <div class="px-3 py-2">
+      <p class="text-sm truncate">${escapeHtml(item.title)}</p>
+      <p class="text-[11px] text-slate-500">${item.type}${item.metadata?.width ? ` · ${item.metadata.width}×${item.metadata.height}` : ""}</p>
+    </div>`;
+
+  if (item.status === "ready") el.onclick = () => play(item);
+  return el;
+}
+
+/* ── Playback ──────────────────────────────────────────────────────── */
+function play(item) {
+  closePlayer();
+  $("playerModal").classList.remove("hidden");
+  $("playerTitle").textContent = item.title;
+  const body = $("playerBody");
+  const tok = encodeURIComponent(token);
+
+  if (item.type === "video") {
+    const video = document.createElement("video");
+    video.controls = true; video.autoplay = true; video.playsInline = true;
+    video.className = "w-full max-h-[70vh] object-contain";
+    body.appendChild(video);
+
+    // master.m3u8 lists the 1080p/720p variants; hls.js switches between
+    // them adaptively. The server falls back to a single-variant playlist
+    // for items transcoded before the multi-bitrate upgrade.
+    const src = `${API}/media/stream/${item.id}/master.m3u8?token=${tok}`;
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src; // Safari / iOS: native HLS
+    } else if (window.Hls && Hls.isSupported()) {
+      hls = new Hls();
+      hls.loadSource(src);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data.fatal) $("playerInfo").textContent = "HLS error: " + data.details;
+      });
+    }
+  } else if (item.type === "audio") {
+    const wrap = document.createElement("div");
+    wrap.className = "w-full p-8 flex flex-col items-center gap-4";
+    if (item.thumbnail_path) {
+      const art = document.createElement("img");
+      art.src = `${API}/media/thumb/${item.id}?token=${tok}`;
+      art.className = "w-40 h-40 object-cover rounded-xl shadow-lg";
+      art.alt = "";
+      wrap.appendChild(art);
+    }
+    const audio = document.createElement("audio");
+    audio.controls = true; audio.autoplay = true;
+    audio.className = "w-full max-w-md";
+    audio.src = `${API}/media/raw/${item.id}?token=${tok}`;
+    wrap.appendChild(audio);
+    body.appendChild(wrap);
+  } else {
+    // Photo: never stretch. object-contain + natural width keeps the exact
+    // aspect ratio at full quality inside the 70vh stage.
+    const img = document.createElement("img");
+    img.src = `${API}/media/raw/${item.id}?token=${tok}`;
+    img.alt = item.title;
+    img.className = "max-w-full max-h-[70vh] w-auto h-auto object-contain";
+    body.appendChild(img);
+  }
+
+  const md = item.metadata || {};
+  $("playerInfo").textContent = [
+    md.width && md.height ? `${md.width}×${md.height}` : "",
+    md.video_codec, md.audio_codec,
+    md.frame_rate ? Math.round(md.frame_rate) + " fps" : "",
+    md.bitrate_bps ? Math.round(md.bitrate_bps / 1000) + " kbps" : "",
+    md.tags?.artist ? "♪ " + md.tags.artist : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function closePlayer() {
+  if (hls) { hls.destroy(); hls = null; }
+  $("playerBody").innerHTML = "";
+  $("playerInfo").textContent = "";
+  $("playerModal").classList.add("hidden");
+}
+
+/* ── Helpers & wiring ──────────────────────────────────────────────── */
+function fmtDuration(s) {
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function render() {
+  const authed = Boolean(token);
+  $("authPanel").classList.toggle("hidden", authed);
+  $("uploadPanel").classList.toggle("hidden", !authed);
+  $("libraryPanel").classList.toggle("hidden", !authed);
+  $("logoutBtn").classList.toggle("hidden", !authed);
+  $("whoami").textContent = authed && user ? user.username : "";
+}
+
+$("loginBtn").onclick = () => login().catch((e) => $("authError").textContent = e.message);
+$("registerBtn").onclick = () => register().catch((e) => $("authError").textContent = e.message);
+$("logoutBtn").onclick = logout;
+$("refreshBtn").onclick = loadLibrary;
+$("typeFilter").onchange = loadLibrary;
+$("closePlayer").onclick = closePlayer;
+$("playerModal").onclick = (e) => { if (e.target === $("playerModal")) closePlayer(); };
+$("password").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePlayer(); });
+
+const zone = $("dropZone");
+zone.onclick = () => $("fileInput").click();
+$("fileInput").onchange = (e) => { handleFiles(e.target.files); e.target.value = ""; };
+["dragenter", "dragover"].forEach((ev) => zone.addEventListener(ev, (e) => {
+  e.preventDefault(); zone.classList.add("border-indigo-500", "bg-indigo-500/5");
+}));
+["dragleave", "drop"].forEach((ev) => zone.addEventListener(ev, (e) => {
+  e.preventDefault(); zone.classList.remove("border-indigo-500", "bg-indigo-500/5");
+}));
+zone.addEventListener("drop", (e) => handleFiles(e.dataTransfer.files));
+
+render();
+if (token) { connectWS(); loadLibrary(); }
+</script>
+</body>
+</html>

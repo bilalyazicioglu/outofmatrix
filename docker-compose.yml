@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mediauser
+      POSTGRES_PASSWORD: mediapass
+      POSTGRES_DB: mediacloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Schema files are applied automatically on first boot of a fresh volume.
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Published for the local dev flow (`make db-up` + `make run` on the
+      # host). Remove if the stack only ever runs fully containerized.
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mediauser -d mediacloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://mediauser:mediapass@db:5432/mediacloud?sslmode=disable
+      STORAGE_PATH: /data/media
+      # CHANGE THIS in production; see .env.example.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-9f2c1a7e}
+      MAX_WORKERS: "2"
+      JOB_QUEUE_SIZE: "128"
+      PROCESS_TIMEOUT: 45m
+      MAX_UPLOAD_BYTES: "10737418240"
+      HLS_SEGMENT_SECONDS: "6"
+    volumes:
+      - mediadata:/data/media
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
+  mediadata:
