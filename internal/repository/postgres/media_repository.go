@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,7 +27,17 @@ func NewMediaRepository(pool *pgxpool.Pool) *MediaRepository {
 }
 
 const mediaColumns = `id, user_id, title, file_path, type, status, file_size, mime_type,
-	blur_hash, thumbnail_path, hls_path, metadata, created_at, updated_at`
+	blur_hash, thumbnail_path, hls_path, is_favorite, captured_at, metadata, created_at, updated_at`
+
+// prefixColumns qualifies every column in a comma-separated list with a table
+// alias, e.g. prefixColumns("id, title", "m.") → "m.id, m.title".
+func prefixColumns(columns, prefix string) string {
+	parts := strings.Split(columns, ",")
+	for i, p := range parts {
+		parts[i] = prefix + strings.TrimSpace(p)
+	}
+	return strings.Join(parts, ", ")
+}
 
 func (r *MediaRepository) Save(ctx context.Context, m *domain.MediaItem) error {
 	meta, err := json.Marshal(m.Metadata)
@@ -35,10 +46,10 @@ func (r *MediaRepository) Save(ctx context.Context, m *domain.MediaItem) error {
 	}
 	_, err = r.pool.Exec(ctx, `
 		INSERT INTO media_items (`+mediaColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
 		m.ID, m.UserID, m.Title, m.FilePath, string(m.Type), string(m.Status),
-		m.FileSize, m.MimeType, m.BlurHash, m.ThumbnailPath, m.HLSPath, meta,
-		m.CreatedAt, m.UpdatedAt,
+		m.FileSize, m.MimeType, m.BlurHash, m.ThumbnailPath, m.HLSPath,
+		m.IsFavorite, m.CapturedAt, meta, m.CreatedAt, m.UpdatedAt,
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -54,6 +65,8 @@ func (r *MediaRepository) Update(ctx context.Context, m *domain.MediaItem) error
 	if err != nil {
 		return fmt.Errorf("media repository: marshal metadata: %w", err)
 	}
+	// is_favorite is deliberately absent: it is owned by SetFavorite so a
+	// favorite toggled mid-processing is never clobbered by the pipeline.
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE media_items
 		SET title = $2,
@@ -61,11 +74,12 @@ func (r *MediaRepository) Update(ctx context.Context, m *domain.MediaItem) error
 		    blur_hash = $4,
 		    thumbnail_path = $5,
 		    hls_path = $6,
-		    metadata = $7,
-		    updated_at = $8
+		    captured_at = $7,
+		    metadata = $8,
+		    updated_at = $9
 		WHERE id = $1`,
 		m.ID, m.Title, string(m.Status), m.BlurHash, m.ThumbnailPath,
-		m.HLSPath, meta, m.UpdatedAt,
+		m.HLSPath, m.CapturedAt, meta, m.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("media repository: update %s: %w", m.ID, err)
@@ -91,22 +105,70 @@ func (r *MediaRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.M
 	return m, nil
 }
 
-func (r *MediaRepository) ListByUserID(ctx context.Context, userID uuid.UUID, mediaType domain.MediaType, limit, offset int) ([]*domain.MediaItem, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+mediaColumns+`
+// mediaFilterSQL builds the WHERE conditions (beyond user_id = $1) and the
+// matching argument list for a MediaListOptions filter.
+func mediaFilterSQL(userID uuid.UUID, opts domain.MediaListOptions) (string, []any) {
+	conds := []string{"user_id = $1"}
+	args := []any{userID}
+
+	if opts.Type != "" {
+		args = append(args, string(opts.Type))
+		conds = append(conds, fmt.Sprintf("type = $%d", len(args)))
+	}
+	if opts.FavoritesOnly {
+		conds = append(conds, "is_favorite")
+	}
+	if opts.Query != "" {
+		args = append(args, "%"+escapeLike(opts.Query)+"%")
+		conds = append(conds, fmt.Sprintf("title ILIKE $%d", len(args)))
+	}
+	return strings.Join(conds, " AND "), args
+}
+
+// escapeLike neutralises LIKE wildcards in user input (backslash is the
+// default LIKE escape character in PostgreSQL).
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
+}
+
+// mediaOrderSQL maps a validated MediaSort to a safe ORDER BY clause. The
+// expressions mirror the indexes in migration 003. Sort values are
+// whitelisted here — never interpolated from raw input.
+func mediaOrderSQL(opts domain.MediaListOptions) string {
+	dir := "DESC"
+	if opts.Ascending {
+		dir = "ASC"
+	}
+	switch opts.Sort {
+	case domain.MediaSortName:
+		return fmt.Sprintf("lower(title) %s, id %s", dir, dir)
+	case domain.MediaSortCaptured:
+		return fmt.Sprintf("COALESCE(captured_at, created_at) %s, id %s", dir, dir)
+	default: // MediaSortAdded
+		return fmt.Sprintf("created_at %s, id %s", dir, dir)
+	}
+}
+
+func (r *MediaRepository) ListByUserID(ctx context.Context, userID uuid.UUID, opts domain.MediaListOptions) ([]*domain.MediaItem, error) {
+	where, args := mediaFilterSQL(userID, opts)
+	args = append(args, opts.Limit, opts.Offset)
+	query := fmt.Sprintf(`
+		SELECT %s
 		FROM media_items
-		WHERE user_id = $1
-		  AND ($2 = '' OR type = $2)
-		ORDER BY created_at DESC, id DESC
-		LIMIT $3 OFFSET $4`,
-		userID, string(mediaType), limit, offset,
+		WHERE %s
+		ORDER BY %s
+		LIMIT $%d OFFSET $%d`,
+		mediaColumns, where, mediaOrderSQL(opts), len(args)-1, len(args),
 	)
+
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("media repository: list for user %s: %w", userID, err)
 	}
 	defer rows.Close()
 
-	items := make([]*domain.MediaItem, 0, limit)
+	items := make([]*domain.MediaItem, 0, opts.Limit)
 	for rows.Next() {
 		m, err := scanMediaItem(rows)
 		if err != nil {
@@ -120,19 +182,33 @@ func (r *MediaRepository) ListByUserID(ctx context.Context, userID uuid.UUID, me
 	return items, nil
 }
 
-func (r *MediaRepository) CountByUserID(ctx context.Context, userID uuid.UUID, mediaType domain.MediaType) (int64, error) {
+func (r *MediaRepository) CountByUserID(ctx context.Context, userID uuid.UUID, opts domain.MediaListOptions) (int64, error) {
+	where, args := mediaFilterSQL(userID, opts)
 	var total int64
-	err := r.pool.QueryRow(ctx, `
-		SELECT count(*)
-		FROM media_items
-		WHERE user_id = $1
-		  AND ($2 = '' OR type = $2)`,
-		userID, string(mediaType),
+	err := r.pool.QueryRow(ctx,
+		fmt.Sprintf(`SELECT count(*) FROM media_items WHERE %s`, where),
+		args...,
 	).Scan(&total)
 	if err != nil {
 		return 0, fmt.Errorf("media repository: count for user %s: %w", userID, err)
 	}
 	return total, nil
+}
+
+func (r *MediaRepository) SetFavorite(ctx context.Context, id uuid.UUID, favorite bool) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE media_items
+		SET is_favorite = $2, updated_at = now()
+		WHERE id = $1`,
+		id, favorite,
+	)
+	if err != nil {
+		return fmt.Errorf("media repository: set favorite %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("media repository: set favorite %s: %w", id, domain.ErrNotFound)
+	}
+	return nil
 }
 
 func (r *MediaRepository) ListIDsByStatus(ctx context.Context, statuses []domain.MediaStatus, limit int) ([]uuid.UUID, error) {
@@ -190,7 +266,7 @@ func scanMediaItem(row pgx.Row) (*domain.MediaItem, error) {
 	err := row.Scan(
 		&m.ID, &m.UserID, &m.Title, &m.FilePath, &mtype, &status,
 		&m.FileSize, &m.MimeType, &m.BlurHash, &m.ThumbnailPath, &m.HLSPath,
-		&metaJSON, &m.CreatedAt, &m.UpdatedAt,
+		&m.IsFavorite, &m.CapturedAt, &metaJSON, &m.CreatedAt, &m.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

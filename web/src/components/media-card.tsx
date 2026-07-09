@@ -1,5 +1,6 @@
 import { memo, useMemo, useState } from "react"
 import {
+  HeartIcon,
   ImageIcon,
   Loader2Icon,
   MusicIcon,
@@ -22,6 +23,7 @@ interface MediaCardProps {
   /** Latest WebSocket event for this item while it is being processed. */
   live?: MediaEvent
   onOpen: (item: MediaItem) => void
+  onToggleFavorite: (item: MediaItem) => void
 }
 
 const typeIcon = {
@@ -48,6 +50,7 @@ export const MediaCard = memo(function MediaCard({
   item,
   live,
   onOpen,
+  onToggleFavorite,
 }: MediaCardProps) {
   const [thumbLoaded, setThumbLoaded] = useState(false)
 
@@ -66,10 +69,17 @@ export const MediaCard = memo(function MediaCard({
   const progress = live ? Math.max(0, Math.min(100, live.progress)) : 0
 
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={ready ? 0 : -1}
+      aria-label={item.title}
       onClick={() => ready && onOpen(item)}
-      disabled={!ready}
+      onKeyDown={(e) => {
+        if (ready && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault()
+          onOpen(item)
+        }
+      }}
       className={cn(
         "media-cell group relative aspect-square w-full overflow-hidden rounded-xl",
         "border border-white/[0.06] bg-secondary/40 text-left",
@@ -126,6 +136,34 @@ export const MediaCard = memo(function MediaCard({
         </div>
       </div>
 
+      {/* Favorite toggle: always visible when favorited, on hover otherwise */}
+      {ready && (
+        <button
+          type="button"
+          aria-label={item.is_favorite ? "Remove from favorites" : "Add to favorites"}
+          aria-pressed={item.is_favorite}
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleFavorite(item)
+          }}
+          className={cn(
+            "absolute top-2 left-2 z-10 flex size-7 items-center justify-center rounded-full",
+            "bg-black/50 backdrop-blur-sm transition-all duration-200",
+            "hover:scale-110 hover:bg-black/70 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+            item.is_favorite
+              ? "opacity-100"
+              : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+          )}
+        >
+          <HeartIcon
+            className={cn(
+              "size-4 transition-colors",
+              item.is_favorite ? "fill-rose-500 text-rose-500" : "text-white/80"
+            )}
+          />
+        </button>
+      )}
+
       {/* Type chip */}
       <Badge
         variant="secondary"
@@ -161,6 +199,6 @@ export const MediaCard = memo(function MediaCard({
           </span>
         </div>
       )}
-    </button>
+    </div>
   )
 })

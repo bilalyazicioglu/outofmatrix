@@ -1,30 +1,43 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
+  ArrowUpDownIcon,
+  HeartIcon,
   ImageIcon,
   Loader2Icon,
   LogOutIcon,
   MusicIcon,
   PlayIcon,
+  SearchIcon,
   SparklesIcon,
   UserIcon,
   VideoIcon,
+  XIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
   clearSession,
+  createCollection,
+  deleteCollection,
+  getCollection,
   getMedia,
   getStoredUser,
   getToken,
+  listCollections,
   listMedia,
+  patchMedia,
+  removeFromCollection,
   uploadFile,
+  type Collection,
   type MediaEvent,
   type MediaItem,
+  type MediaSort,
   type MediaType,
   type User,
 } from "@/lib/api"
 import { useMediaEvents } from "@/hooks/use-media-events"
 import { cn } from "@/lib/utils"
+import { AlbumsBar } from "@/components/albums-bar"
 import { Aurora } from "@/components/aurora"
 import { LoginView } from "@/components/login-view"
 import { MediaCard } from "@/components/media-card"
@@ -36,9 +49,12 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
@@ -54,6 +70,12 @@ const FILTERS: Array<{ value: Filter; label: string; icon: typeof ImageIcon }> =
     { value: "video", label: "Videos", icon: VideoIcon },
     { value: "audio", label: "Music", icon: MusicIcon },
   ]
+
+const SORT_LABELS: Record<MediaSort, string> = {
+  added: "Date added",
+  captured: "Date taken",
+  name: "Name",
+}
 
 export default function App() {
   const [user, setUser] = useState<User | null>(() =>
@@ -87,35 +109,81 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [items, setItems] = useState<MediaItem[]>([])
   const [total, setTotal] = useState(0)
   const [filter, setFilter] = useState<Filter>("")
+  const [favOnly, setFavOnly] = useState(false)
+  const [searchInput, setSearchInput] = useState("")
+  const [query, setQuery] = useState("")
+  const [sort, setSort] = useState<MediaSort>("added")
+  const [ascending, setAscending] = useState(false)
+  const [albums, setAlbums] = useState<Collection[]>([])
+  const [activeAlbum, setActiveAlbum] = useState<Collection | null>(null)
+  const [albumItems, setAlbumItems] = useState<MediaItem[]>([])
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [live, setLive] = useState<Record<string, MediaEvent>>({})
   const [uploads, setUploads] = useState<ActiveUpload[]>([])
   const [playing, setPlaying] = useState<MediaItem | null>(null)
-  const filterRef = useRef(filter)
-  filterRef.current = filter
 
-  const refresh = useCallback(async (f: Filter) => {
+  // Latest view state for use inside long-lived callbacks (WS, uploads).
+  const viewRef = useRef({ filter, favOnly, query, activeAlbum })
+  viewRef.current = { filter, favOnly, query, activeAlbum }
+
+  // Debounce the search box into the applied query.
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(searchInput.trim()), 300)
+    return () => clearTimeout(t)
+  }, [searchInput])
+
+  // --- Data loading ------------------------------------------------------------
+
+  const load = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await listMedia(f, PAGE_SIZE, 0)
-      setItems(res.items)
-      setTotal(res.total)
+      if (viewRef.current.activeAlbum) {
+        const res = await getCollection(viewRef.current.activeAlbum.id)
+        setAlbumItems(res.items)
+      } else {
+        const res = await listMedia({
+          type: viewRef.current.filter,
+          favorite: viewRef.current.favOnly,
+          query: viewRef.current.query,
+          sort,
+          ascending,
+          limit: PAGE_SIZE,
+          offset: 0,
+        })
+        setItems(res.items)
+        setTotal(res.total)
+      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to load library")
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [sort, ascending])
 
   useEffect(() => {
-    void refresh(filter)
-  }, [filter, refresh])
+    void load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, favOnly, query, sort, ascending, activeAlbum])
+
+  useEffect(() => {
+    listCollections()
+      .then(setAlbums)
+      .catch(() => toast.error("Failed to load albums"))
+  }, [])
 
   const loadMore = async () => {
     setLoadingMore(true)
     try {
-      const res = await listMedia(filter, PAGE_SIZE, items.length)
+      const res = await listMedia({
+        type: filter,
+        favorite: favOnly,
+        query,
+        sort,
+        ascending,
+        limit: PAGE_SIZE,
+        offset: items.length,
+      })
       setItems((prev) => [...prev, ...res.items])
       setTotal(res.total)
     } catch (err) {
@@ -124,6 +192,116 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
       setLoadingMore(false)
     }
   }
+
+  // In album mode, filters and sorting apply client-side to the album's items;
+  // albums are curated and small, so this stays cheap.
+  const displayed = useMemo(() => {
+    if (!activeAlbum) return items
+    let list = albumItems
+    if (filter) list = list.filter((i) => i.type === filter)
+    if (favOnly) list = list.filter((i) => i.is_favorite)
+    if (query) {
+      const q = query.toLowerCase()
+      list = list.filter((i) => i.title.toLowerCase().includes(q))
+    }
+    if (sort === "added" && !ascending) return list // curated album order
+    const dir = ascending ? 1 : -1
+    return [...list].sort((a, b) => {
+      switch (sort) {
+        case "name":
+          return dir * a.title.localeCompare(b.title, undefined, { sensitivity: "base" })
+        case "captured": {
+          const ta = Date.parse(a.captured_at ?? a.created_at)
+          const tb = Date.parse(b.captured_at ?? b.created_at)
+          return dir * (ta - tb)
+        }
+        default:
+          return dir * (Date.parse(a.created_at) - Date.parse(b.created_at))
+      }
+    })
+  }, [activeAlbum, items, albumItems, filter, favOnly, query, sort, ascending])
+
+  const shownTotal = activeAlbum ? displayed.length : total
+
+  // --- Item mutations ------------------------------------------------------------
+
+  const replaceItem = useCallback((updated: MediaItem) => {
+    const map = (prev: MediaItem[]) =>
+      prev.map((i) => (i.id === updated.id ? updated : i))
+    setItems(map)
+    setAlbumItems(map)
+    setPlaying((p) => (p && p.id === updated.id ? updated : p))
+  }, [])
+
+  const removeItem = useCallback((id: string) => {
+    setItems((prev) => prev.filter((i) => i.id !== id))
+    setAlbumItems((prev) => prev.filter((i) => i.id !== id))
+    setTotal((t) => Math.max(0, t - 1))
+  }, [])
+
+  const toggleFavorite = useCallback(
+    (item: MediaItem) => {
+      const next = !item.is_favorite
+      // Optimistic flip; revert on failure.
+      replaceItem({ ...item, is_favorite: next })
+      patchMedia(item.id, { is_favorite: next })
+        .then((updated) => {
+          replaceItem(updated)
+          // The item no longer belongs to a favorites-only server view.
+          if (!next && viewRef.current.favOnly && !viewRef.current.activeAlbum) {
+            setItems((prev) => prev.filter((i) => i.id !== updated.id))
+            setTotal((t) => Math.max(0, t - 1))
+          }
+        })
+        .catch((err: unknown) => {
+          replaceItem(item)
+          toast.error(err instanceof Error ? err.message : "Update failed")
+        })
+    },
+    [replaceItem]
+  )
+
+  // --- Albums ------------------------------------------------------------------
+
+  const createAlbum = useCallback(async (name: string) => {
+    try {
+      const album = await createCollection(name)
+      setAlbums((prev) => [...prev, album])
+      toast.success(`Album "${album.name}" created`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to create album")
+      throw err
+    }
+  }, [])
+
+  const deleteAlbum = useCallback((album: Collection) => {
+    deleteCollection(album.id)
+      .then(() => {
+        setAlbums((prev) => prev.filter((a) => a.id !== album.id))
+        setActiveAlbum((a) => (a?.id === album.id ? null : a))
+        toast.success(`Album "${album.name}" deleted`)
+      })
+      .catch((err: unknown) =>
+        toast.error(err instanceof Error ? err.message : "Failed to delete album")
+      )
+  }, [])
+
+  const removeFromAlbum = useCallback(
+    (item: MediaItem) => {
+      const album = viewRef.current.activeAlbum
+      if (!album) return
+      removeFromCollection(album.id, item.id)
+        .then(() => {
+          setAlbumItems((prev) => prev.filter((i) => i.id !== item.id))
+          setPlaying(null)
+          toast.success(`Removed from "${album.name}"`)
+        })
+        .catch((err: unknown) =>
+          toast.error(err instanceof Error ? err.message : "Failed to remove")
+        )
+    },
+    []
+  )
 
   // --- Live processing events ------------------------------------------------
 
@@ -149,7 +327,6 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
           toast.success(`"${item.title}" is ready`)
         })
         .catch(() => {
-          // Item may be filtered out of the current view; drop the event.
           setLive((prev) => {
             const next = { ...prev }
             delete next[evt.media_id]
@@ -218,8 +395,8 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
               progress: 0,
             },
           }))
-          const f = filterRef.current
-          if (f === "" || f === item.type) {
+          const v = viewRef.current
+          if (!v.activeAlbum && (v.filter === "" || v.filter === item.type)) {
             setItems((prev) =>
               prev.some((i) => i.id === item.id) ? prev : [item, ...prev]
             )
@@ -243,7 +420,36 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
     setUploads((prev) => prev.filter((u) => u.key !== key))
   }, [])
 
+  // --- Player navigation ----------------------------------------------------------
+
+  const playable = useMemo(
+    () => displayed.filter((i) => i.status === "ready"),
+    [displayed]
+  )
+  const playingIndex = playing
+    ? playable.findIndex((i) => i.id === playing.id)
+    : -1
+  const onPrev =
+    playingIndex > 0 ? () => setPlaying(playable[playingIndex - 1]) : undefined
+  const onNext =
+    playingIndex >= 0 && playingIndex < playable.length - 1
+      ? () => setPlaying(playable[playingIndex + 1])
+      : undefined
+
   // --- Render --------------------------------------------------------------------
+
+  const directionLabels =
+    sort === "name"
+      ? { desc: "Z → A", asc: "A → Z" }
+      : { desc: "Newest first", asc: "Oldest first" }
+
+  const emptyMessage = activeAlbum
+    ? "This album is empty — open something and use the Album button to file it here."
+    : favOnly
+      ? "No favorites yet — tap the heart on anything you love."
+      : query
+        ? `Nothing matches "${query}".`
+        : "Drop some photos, music or videos above — they'll be transcoded for streaming automatically."
 
   return (
     <div className="relative min-h-svh">
@@ -306,14 +512,22 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-6xl gap-6 px-4 py-6">
+      <main className="mx-auto grid max-w-6xl gap-5 px-4 py-6">
         <UploadZone
           uploads={uploads}
           onFiles={startUploads}
           onDismiss={dismissUpload}
         />
 
-        <div className="flex flex-wrap items-center justify-between gap-3">
+        <AlbumsBar
+          albums={albums}
+          active={activeAlbum}
+          onSelect={setActiveAlbum}
+          onCreate={createAlbum}
+          onDelete={deleteAlbum}
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
           <Tabs value={filter} onValueChange={(v) => setFilter(v as Filter)}>
             <TabsList>
               {FILTERS.map(({ value, label, icon: Icon }) => (
@@ -324,9 +538,84 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
               ))}
             </TabsList>
           </Tabs>
-          <span className="text-xs text-muted-foreground">
-            {total} item{total === 1 ? "" : "s"}
-          </span>
+
+          <Button
+            variant={favOnly ? "secondary" : "ghost"}
+            size="sm"
+            aria-pressed={favOnly}
+            onClick={() => setFavOnly((f) => !f)}
+            className={cn(favOnly && "text-rose-300")}
+          >
+            <HeartIcon
+              className={cn("size-4", favOnly && "fill-rose-500 text-rose-500")}
+            />
+            Favorites
+          </Button>
+
+          <div className="ml-auto flex items-center gap-2">
+            <div className="relative">
+              <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                placeholder="Search…"
+                aria-label="Search library"
+                className="h-9 w-40 pl-8 sm:w-56"
+              />
+              {searchInput && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  onClick={() => setSearchInput("")}
+                  className="absolute top-1/2 right-2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                >
+                  <XIcon className="size-3.5" />
+                </button>
+              )}
+            </div>
+
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="h-9">
+                  <ArrowUpDownIcon className="size-4" />
+                  <span className="hidden sm:inline">{SORT_LABELS[sort]}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-44">
+                <DropdownMenuLabel>Sort by</DropdownMenuLabel>
+                <DropdownMenuRadioGroup
+                  value={sort}
+                  onValueChange={(v) => setSort(v as MediaSort)}
+                >
+                  <DropdownMenuRadioItem value="added">
+                    Date added
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="captured">
+                    Date taken
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="name">
+                    Name
+                  </DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+                <DropdownMenuSeparator />
+                <DropdownMenuRadioGroup
+                  value={ascending ? "asc" : "desc"}
+                  onValueChange={(v) => setAscending(v === "asc")}
+                >
+                  <DropdownMenuRadioItem value="desc">
+                    {directionLabels.desc}
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="asc">
+                    {directionLabels.asc}
+                  </DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            <span className="hidden text-xs whitespace-nowrap text-muted-foreground md:inline">
+              {shownTotal} item{shownTotal === 1 ? "" : "s"}
+            </span>
+          </div>
         </div>
 
         {loading ? (
@@ -335,31 +624,43 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
               <Skeleton key={i} className="aspect-square rounded-xl" />
             ))}
           </div>
-        ) : items.length === 0 ? (
+        ) : displayed.length === 0 ? (
           <div className="flex flex-col items-center gap-3 rounded-2xl border border-white/[0.06] bg-white/[0.02] px-6 py-20 text-center">
             <div className="flex size-14 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500/20 to-fuchsia-500/15">
-              <SparklesIcon className="size-7 text-violet-300/70" />
+              {favOnly ? (
+                <HeartIcon className="size-7 text-rose-300/70" />
+              ) : (
+                <SparklesIcon className="size-7 text-violet-300/70" />
+              )}
             </div>
-            <p className="font-medium">Your library is empty</p>
+            <p className="font-medium">
+              {activeAlbum
+                ? `"${activeAlbum.name}" is empty`
+                : favOnly
+                  ? "No favorites yet"
+                  : query
+                    ? "No results"
+                    : "Your library is empty"}
+            </p>
             <p className="max-w-sm text-sm text-muted-foreground">
-              Drop some photos, music or videos above — they'll be transcoded
-              for streaming automatically.
+              {emptyMessage}
             </p>
           </div>
         ) : (
           <>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-              {items.map((item) => (
+              {displayed.map((item) => (
                 <MediaCard
                   key={item.id}
                   item={item}
                   live={live[item.id]}
                   onOpen={setPlaying}
+                  onToggleFavorite={toggleFavorite}
                 />
               ))}
             </div>
 
-            {items.length < total && (
+            {!activeAlbum && items.length < total && (
               <div className="flex justify-center pb-4">
                 <Button
                   variant="secondary"
@@ -380,10 +681,13 @@ function Library({ user, onLogout }: { user: User; onLogout: () => void }) {
       <PlayerDialog
         item={playing}
         onClose={() => setPlaying(null)}
-        onDeleted={(id) => {
-          setItems((prev) => prev.filter((i) => i.id !== id))
-          setTotal((t) => Math.max(0, t - 1))
-        }}
+        onDeleted={removeItem}
+        onUpdated={replaceItem}
+        onPrev={onPrev}
+        onNext={onNext}
+        albums={albums}
+        activeAlbum={activeAlbum}
+        onRemoveFromAlbum={removeFromAlbum}
       />
     </div>
   )

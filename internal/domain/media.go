@@ -84,9 +84,37 @@ type MediaItem struct {
 	BlurHash      string        `json:"blur_hash,omitempty"`
 	ThumbnailPath string        `json:"thumbnail_path,omitempty"`
 	HLSPath       string        `json:"hls_path,omitempty"`
-	Metadata      MediaMetadata `json:"metadata"`
-	CreatedAt     time.Time     `json:"created_at"`
-	UpdatedAt     time.Time     `json:"updated_at"`
+	IsFavorite    bool          `json:"is_favorite"`
+	// CapturedAt is when the media was actually taken/recorded, extracted
+	// from container metadata during processing. Nil when unknown.
+	CapturedAt *time.Time    `json:"captured_at,omitempty"`
+	Metadata   MediaMetadata `json:"metadata"`
+	CreatedAt  time.Time     `json:"created_at"`
+	UpdatedAt  time.Time     `json:"updated_at"`
+}
+
+// MediaSort selects the library ordering.
+type MediaSort string
+
+const (
+	MediaSortAdded    MediaSort = "added"    // upload time (default)
+	MediaSortName     MediaSort = "name"     // title, case-insensitive
+	MediaSortCaptured MediaSort = "captured" // capture date, falls back to upload time
+)
+
+func (s MediaSort) Valid() bool {
+	return s == "" || s == MediaSortAdded || s == MediaSortName || s == MediaSortCaptured
+}
+
+// MediaListOptions filters and orders one page of a user's library.
+type MediaListOptions struct {
+	Type          MediaType // empty = all types
+	FavoritesOnly bool
+	Query         string // case-insensitive substring match on title
+	Sort          MediaSort
+	Ascending     bool
+	Limit         int
+	Offset        int
 }
 
 // MediaRepository is the persistence port for media items.
@@ -94,10 +122,13 @@ type MediaRepository interface {
 	Save(ctx context.Context, m *MediaItem) error
 	Update(ctx context.Context, m *MediaItem) error
 	FindByID(ctx context.Context, id uuid.UUID) (*MediaItem, error)
-	// ListByUserID returns a page of a user's media, newest first. An empty
-	// mediaType returns all types.
-	ListByUserID(ctx context.Context, userID uuid.UUID, mediaType MediaType, limit, offset int) ([]*MediaItem, error)
-	CountByUserID(ctx context.Context, userID uuid.UUID, mediaType MediaType) (int64, error)
+	// ListByUserID returns a page of a user's media filtered and ordered by
+	// opts; CountByUserID counts the same result set.
+	ListByUserID(ctx context.Context, userID uuid.UUID, opts MediaListOptions) ([]*MediaItem, error)
+	CountByUserID(ctx context.Context, userID uuid.UUID, opts MediaListOptions) (int64, error)
+	// SetFavorite flips the favorite flag without touching the rest of the
+	// row, so it can never race with the processing pipeline's Update.
+	SetFavorite(ctx context.Context, id uuid.UUID, favorite bool) error
 	// ListIDsByStatus is used at boot to recover jobs that were queued or
 	// in flight when the process last stopped.
 	ListIDsByStatus(ctx context.Context, statuses []MediaStatus, limit int) ([]uuid.UUID, error)

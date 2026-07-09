@@ -109,9 +109,9 @@ func (r *CollectionRepository) RemoveItem(ctx context.Context, collectionID, med
 }
 
 func (r *CollectionRepository) ListItems(ctx context.Context, collectionID uuid.UUID) ([]*domain.MediaItem, error) {
+	// Column list must stay in sync with scanMediaItem — reuse mediaColumns.
 	rows, err := r.pool.Query(ctx, `
-		SELECT m.id, m.user_id, m.title, m.file_path, m.type, m.status, m.file_size, m.mime_type,
-		       m.blur_hash, m.thumbnail_path, m.hls_path, m.metadata, m.created_at, m.updated_at
+		SELECT `+prefixColumns(mediaColumns, "m.")+`
 		FROM collection_items ci
 		JOIN media_items m ON m.id = ci.media_id
 		WHERE ci.collection_id = $1

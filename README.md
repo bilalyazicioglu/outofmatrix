@@ -47,9 +47,13 @@ fresh database volume.
 The UI in `web/` is a Vite + React + TypeScript app built on shadcn/ui
 (Radix primitives, Tailwind CSS v4, self-hosted Geist font): drag-and-drop
 resumable uploads with live per-byte progress, WebSocket-driven processing
-overlays on each card, BlurHash placeholders decoded client-side, and an
-hls.js player that is lazy-loaded only when the first video is opened —
-everything else ships as one ~120 KB gzipped bundle. `npm run build` emits
+overlays on each card, BlurHash placeholders decoded client-side, favorites,
+albums for filing media, title search, sorting (date added / date taken /
+name, both directions), inline rename, original download, prev/next
+navigation in the player, and an hls.js player that is lazy-loaded only when
+the first video is opened — everything else ships as one ~120 KB gzipped
+bundle. The capture date comes from container metadata (`creation_time` and
+friends) extracted by ffprobe into the `captured_at` column. `npm run build` emits
 hashed assets into `static/`, which the Go server serves with
 `immutable` cache headers (and `no-cache` for `index.html`).
 
@@ -80,8 +84,9 @@ proxying `/api` (including the WebSocket) to the Go server on :8080.
 | POST   | `/api/v1/uploads/{id}/complete`             | assemble → MediaItem → queue processing  |
 | DELETE | `/api/v1/uploads/{id}`                      | abort session                            |
 | POST   | `/api/v1/media/upload`                      | legacy single-request multipart upload   |
-| GET    | `/api/v1/media?type=&limit=&offset=`        | paginated library, newest first          |
+| GET    | `/api/v1/media?type=&favorite=&q=&sort=&order=&limit=&offset=` | paginated library: filter by type/favorites, search titles, sort by `added` \| `name` \| `captured` |
 | GET    | `/api/v1/media/{id}`                        | one item incl. extracted metadata        |
+| PATCH  | `/api/v1/media/{id}`                        | `{title?, is_favorite?}` rename/favorite |
 | DELETE | `/api/v1/media/{id}`                        | row + original + derivatives             |
 | GET    | `/api/v1/media/stream/{id}/master.m3u8`     | adaptive HLS master playlist             |
 | GET    | `/api/v1/media/stream/{id}/index_1080p.m3u8`| per-rendition media playlist             |

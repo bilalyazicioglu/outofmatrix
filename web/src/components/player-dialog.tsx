@@ -1,16 +1,33 @@
-import { useEffect, useState } from "react"
-import { Loader2Icon, MusicIcon, Trash2Icon } from "lucide-react"
+import { useEffect, useState, type FormEvent } from "react"
+import {
+  CheckIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  DownloadIcon,
+  FolderPlusIcon,
+  FolderMinusIcon,
+  HeartIcon,
+  Loader2Icon,
+  MusicIcon,
+  PencilIcon,
+  Trash2Icon,
+  XIcon,
+} from "lucide-react"
 import { toast } from "sonner"
 
 import {
+  addToCollection,
   deleteMedia,
   formatBytes,
   formatDuration,
   hlsMasterUrl,
+  patchMedia,
   rawUrl,
   thumbUrl,
+  type Collection,
   type MediaItem,
 } from "@/lib/api"
+import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -21,12 +38,29 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 
 interface PlayerDialogProps {
   item: MediaItem | null
   onClose: () => void
   onDeleted: (id: string) => void
+  /** Called with the fresh item after a rename or favorite toggle. */
+  onUpdated: (item: MediaItem) => void
+  onPrev?: () => void
+  onNext?: () => void
+  albums: Collection[]
+  /** Set when the grid is scoped to an album: enables "remove from album". */
+  activeAlbum?: Collection | null
+  onRemoveFromAlbum?: (item: MediaItem) => void
 }
 
 /**
@@ -86,12 +120,72 @@ function useHls(item: MediaItem | null) {
   return { videoRef: setVideoEl, loading }
 }
 
-export function PlayerDialog({ item, onClose, onDeleted }: PlayerDialogProps) {
+export function PlayerDialog({
+  item,
+  onClose,
+  onDeleted,
+  onUpdated,
+  onPrev,
+  onNext,
+  albums,
+  activeAlbum,
+  onRemoveFromAlbum,
+}: PlayerDialogProps) {
   const { videoRef, loading } = useHls(item)
   const [deleting, setDeleting] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [draftTitle, setDraftTitle] = useState("")
 
-  useEffect(() => setConfirming(false), [item])
+  useEffect(() => {
+    setConfirming(false)
+    setRenaming(false)
+  }, [item])
+
+  const toggleFavorite = async () => {
+    if (!item) return
+    try {
+      const updated = await patchMedia(item.id, {
+        is_favorite: !item.is_favorite,
+      })
+      onUpdated(updated)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Update failed")
+    }
+  }
+
+  const saveTitle = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!item) return
+    const trimmed = draftTitle.trim()
+    if (!trimmed || trimmed === item.title) {
+      setRenaming(false)
+      return
+    }
+    try {
+      const updated = await patchMedia(item.id, { title: trimmed })
+      onUpdated(updated)
+      setRenaming(false)
+      toast.success("Renamed")
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Rename failed")
+    }
+  }
+
+  const addToAlbum = async (album: Collection) => {
+    if (!item) return
+    try {
+      await addToCollection(album.id, item.id)
+      toast.success(`Added to "${album.name}"`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed"
+      if (msg.includes("exists")) {
+        toast.info(`Already in "${album.name}"`)
+      } else {
+        toast.error(msg)
+      }
+    }
+  }
 
   const handleDelete = async () => {
     if (!item) return
@@ -115,7 +209,19 @@ export function PlayerDialog({ item, onClose, onDeleted }: PlayerDialogProps) {
   const meta = item?.metadata
   return (
     <Dialog open={!!item} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-4xl gap-0 overflow-hidden border-white/10 bg-[oklch(0.14_0.03_283)] p-0 sm:max-w-4xl">
+      <DialogContent
+        className="max-w-4xl gap-0 overflow-hidden border-white/10 bg-[oklch(0.14_0.03_283)] p-0 sm:max-w-4xl"
+        onKeyDown={(e) => {
+          if (renaming) return
+          if (e.key === "ArrowLeft" && onPrev) {
+            e.preventDefault()
+            onPrev()
+          } else if (e.key === "ArrowRight" && onNext) {
+            e.preventDefault()
+            onNext()
+          }
+        }}
+      >
         {item && (
           <>
             <div className="relative flex min-h-48 items-center justify-center bg-black">
@@ -130,7 +236,7 @@ export function PlayerDialog({ item, onClose, onDeleted }: PlayerDialogProps) {
                     autoPlay
                     playsInline
                     poster={item.thumbnail_path ? thumbUrl(item.id) : undefined}
-                    className="max-h-[70vh] w-full bg-black"
+                    className="max-h-[68vh] w-full bg-black"
                   />
                 </>
               )}
@@ -140,7 +246,7 @@ export function PlayerDialog({ item, onClose, onDeleted }: PlayerDialogProps) {
                 <img
                   src={rawUrl(item.id)}
                   alt={item.title}
-                  className="h-auto max-h-[70vh] w-auto max-w-full object-contain"
+                  className="h-auto max-h-[68vh] w-auto max-w-full object-contain"
                 />
               )}
 
@@ -165,10 +271,71 @@ export function PlayerDialog({ item, onClose, onDeleted }: PlayerDialogProps) {
                   />
                 </div>
               )}
+
+              {/* Prev / next overlay arrows */}
+              {onPrev && (
+                <button
+                  type="button"
+                  aria-label="Previous"
+                  onClick={onPrev}
+                  className="absolute top-1/2 left-2 -translate-y-1/2 rounded-full bg-black/50 p-2 text-white/70 backdrop-blur-sm transition hover:bg-black/75 hover:text-white"
+                >
+                  <ChevronLeftIcon className="size-5" />
+                </button>
+              )}
+              {onNext && (
+                <button
+                  type="button"
+                  aria-label="Next"
+                  onClick={onNext}
+                  className="absolute top-1/2 right-2 -translate-y-1/2 rounded-full bg-black/50 p-2 text-white/70 backdrop-blur-sm transition hover:bg-black/75 hover:text-white"
+                >
+                  <ChevronRightIcon className="size-5" />
+                </button>
+              )}
             </div>
 
             <DialogHeader className="px-6 pt-5 text-left">
-              <DialogTitle className="pr-8 text-lg">{item.title}</DialogTitle>
+              {renaming ? (
+                <form onSubmit={saveTitle} className="flex items-center gap-2 pr-8">
+                  <Input
+                    autoFocus
+                    value={draftTitle}
+                    onChange={(e) => setDraftTitle(e.target.value)}
+                    maxLength={512}
+                    className="h-9"
+                    onKeyDown={(e) => e.key === "Escape" && setRenaming(false)}
+                  />
+                  <Button type="submit" size="icon" className="size-9 shrink-0" aria-label="Save name">
+                    <CheckIcon className="size-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="size-9 shrink-0"
+                    aria-label="Cancel rename"
+                    onClick={() => setRenaming(false)}
+                  >
+                    <XIcon className="size-4" />
+                  </Button>
+                </form>
+              ) : (
+                <DialogTitle className="group/title flex items-center gap-2 pr-8 text-lg">
+                  <span className="truncate">{item.title}</span>
+                  <button
+                    type="button"
+                    aria-label="Rename"
+                    onClick={() => {
+                      setDraftTitle(item.title)
+                      setRenaming(true)
+                    }}
+                    className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition group-hover/title:opacity-100 hover:text-foreground focus-visible:opacity-100"
+                  >
+                    <PencilIcon className="size-3.5" />
+                  </button>
+                </DialogTitle>
+              )}
               <DialogDescription className="sr-only">
                 Media details and playback
               </DialogDescription>
@@ -197,29 +364,101 @@ export function PlayerDialog({ item, onClose, onDeleted }: PlayerDialogProps) {
                   </Badge>
                 ) : null}
                 <Badge variant="outline">{formatBytes(item.file_size)}</Badge>
+                {item.captured_at && (
+                  <Badge variant="outline">
+                    Taken {new Date(item.captured_at).toLocaleDateString()}
+                  </Badge>
+                )}
               </div>
             </DialogHeader>
 
             <Separator className="mt-5 bg-white/[0.06]" />
 
-            <DialogFooter className="flex-row items-center justify-between px-6 py-4 sm:justify-between">
-              <span className="text-xs text-muted-foreground">
+            <DialogFooter className="flex-row items-center justify-between gap-2 px-6 py-4 sm:justify-between">
+              <span className="hidden text-xs text-muted-foreground sm:inline">
                 Added {new Date(item.created_at).toLocaleDateString()}
               </span>
-              <Button
-                variant={confirming ? "destructive" : "ghost"}
-                size="sm"
-                disabled={deleting}
-                onClick={handleDelete}
-                onBlur={() => setConfirming(false)}
-              >
-                {deleting ? (
-                  <Loader2Icon className="size-4 animate-spin" />
-                ) : (
-                  <Trash2Icon className="size-4" />
-                )}
-                {confirming ? "Really delete?" : "Delete"}
-              </Button>
+
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={toggleFavorite}
+                  aria-pressed={item.is_favorite}
+                >
+                  <HeartIcon
+                    className={cn(
+                      "size-4",
+                      item.is_favorite && "fill-rose-500 text-rose-500"
+                    )}
+                  />
+                  <span className="hidden sm:inline">
+                    {item.is_favorite ? "Favorited" : "Favorite"}
+                  </span>
+                </Button>
+
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="sm">
+                      <FolderPlusIcon className="size-4" />
+                      <span className="hidden sm:inline">Album</span>
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-52">
+                    <DropdownMenuLabel>Add to album</DropdownMenuLabel>
+                    {albums.length === 0 && (
+                      <DropdownMenuItem disabled>
+                        No albums yet — create one below the upload zone
+                      </DropdownMenuItem>
+                    )}
+                    {albums.map((album) => (
+                      <DropdownMenuItem
+                        key={album.id}
+                        onClick={() => addToAlbum(album)}
+                      >
+                        <FolderPlusIcon className="size-4" />
+                        <span className="truncate">{album.name}</span>
+                      </DropdownMenuItem>
+                    ))}
+                    {activeAlbum && onRemoveFromAlbum && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onClick={() => onRemoveFromAlbum(item)}
+                        >
+                          <FolderMinusIcon className="size-4" />
+                          <span className="truncate">
+                            Remove from “{activeAlbum.name}”
+                          </span>
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
+                <Button variant="ghost" size="sm" asChild>
+                  <a href={rawUrl(item.id)} download={item.title}>
+                    <DownloadIcon className="size-4" />
+                    <span className="hidden sm:inline">Download</span>
+                  </a>
+                </Button>
+
+                <Button
+                  variant={confirming ? "destructive" : "ghost"}
+                  size="sm"
+                  disabled={deleting}
+                  onClick={handleDelete}
+                  onBlur={() => setConfirming(false)}
+                >
+                  {deleting ? (
+                    <Loader2Icon className="size-4 animate-spin" />
+                  ) : (
+                    <Trash2Icon className="size-4" />
+                  )}
+                  {confirming ? "Really delete?" : "Delete"}
+                </Button>
+              </div>
             </DialogFooter>
           </>
         )}

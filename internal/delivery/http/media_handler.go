@@ -131,7 +131,8 @@ type listResponse struct {
 	Offset int                 `json:"offset"`
 }
 
-// List handles GET /api/v1/media?type=video&limit=50&offset=0.
+// List handles
+// GET /api/v1/media?type=video&favorite=1&q=beach&sort=name&order=asc&limit=50&offset=0.
 func (h *MediaHandler) List(w http.ResponseWriter, r *http.Request) {
 	userID, _, ok := callerFromContext(r.Context())
 	if !ok {
@@ -140,16 +141,57 @@ func (h *MediaHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	limit := parseIntDefault(q.Get("limit"), 50)
-	offset := parseIntDefault(q.Get("offset"), 0)
-	mediaType := domain.MediaType(q.Get("type"))
+	opts := domain.MediaListOptions{
+		Type:          domain.MediaType(q.Get("type")),
+		FavoritesOnly: q.Get("favorite") == "1" || q.Get("favorite") == "true",
+		Query:         q.Get("q"),
+		Sort:          domain.MediaSort(q.Get("sort")),
+		Ascending:     q.Get("order") == "asc",
+		Limit:         parseIntDefault(q.Get("limit"), 50),
+		Offset:        parseIntDefault(q.Get("offset"), 0),
+	}
 
-	items, total, err := h.media.List(r.Context(), userID, mediaType, limit, offset)
+	items, total, err := h.media.List(r.Context(), userID, opts)
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, listResponse{Items: items, Total: total, Limit: limit, Offset: offset})
+	writeJSON(w, http.StatusOK, listResponse{Items: items, Total: total, Limit: opts.Limit, Offset: opts.Offset})
+}
+
+type patchMediaRequest struct {
+	Title      *string `json:"title"`
+	IsFavorite *bool   `json:"is_favorite"`
+}
+
+// Patch handles PATCH /api/v1/media/{id}: rename and/or toggle favorite.
+// Absent fields are left untouched.
+func (h *MediaHandler) Patch(w http.ResponseWriter, r *http.Request) {
+	userID, role, ok := callerFromContext(r.Context())
+	if !ok {
+		writeError(w, r, domain.ErrUnauthorized)
+		return
+	}
+	id, err := parseID(r)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	var req patchMediaRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	if req.Title == nil && req.IsFavorite == nil {
+		writeError(w, r, fmt.Errorf("%w: nothing to update", domain.ErrInvalidInput))
+		return
+	}
+	item, err := h.media.Edit(r.Context(), userID, role, id, req.Title, req.IsFavorite)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 // Get handles GET /api/v1/media/{id}.

@@ -305,6 +305,7 @@ func (u *MediaUsecase) buildDerivatives(ctx context.Context, item *domain.MediaI
 		FrameRate:       probe.FrameRate,
 		Tags:            probe.Tags,
 	}
+	item.CapturedAt = capturedAtFromTags(probe.Tags)
 	u.notify(item, EventProcessing, "probe", progressProbe, "")
 
 	thumbRel := filepath.Join(dirThumbs, item.ID.String()+".jpg")
@@ -372,6 +373,45 @@ func (u *MediaUsecase) buildDerivatives(ctx context.Context, item *domain.MediaI
 	return nil
 }
 
+// capturedAtTagKeys are container metadata tags that carry the moment the
+// media was actually taken/recorded, in the order we trust them. ffprobe
+// normalises tag keys to lowercase.
+var capturedAtTagKeys = [...]string{
+	"creation_time",                       // MP4/MOV/Matroska
+	"com.apple.quicktime.creationdate",    // iPhone videos (local time w/ zone)
+	"date_time_original", "datetimeoriginal", // EXIF passthrough
+	"date", // ID3 / Vorbis (often just a year)
+}
+
+// capturedAtLayouts covers the date formats seen in the wild for those tags.
+var capturedAtLayouts = [...]string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05.000000Z",
+	"2006-01-02 15:04:05",
+	"2006:01:02 15:04:05", // EXIF
+	"2006-01-02",
+	"2006",
+}
+
+// capturedAtFromTags extracts the capture timestamp from probe tags, or nil
+// when nothing parseable is present.
+func capturedAtFromTags(tags map[string]string) *time.Time {
+	for _, key := range capturedAtTagKeys {
+		raw := strings.TrimSpace(tags[key])
+		if raw == "" {
+			continue
+		}
+		for _, layout := range capturedAtLayouts {
+			if t, err := time.Parse(layout, raw); err == nil {
+				utc := t.UTC()
+				return &utc
+			}
+		}
+	}
+	return nil
+}
+
 // blurHashFromJPEG computes the BlurHash placeholder from an on-disk JPEG
 // thumbnail. Failures are logged and return an empty hash: a missing
 // placeholder never blocks the pipeline.
@@ -428,25 +468,65 @@ func (u *MediaUsecase) Get(ctx context.Context, requesterID uuid.UUID, requester
 }
 
 // List returns one page of the requester's own media plus the total count.
-func (u *MediaUsecase) List(ctx context.Context, userID uuid.UUID, mediaType domain.MediaType, limit, offset int) ([]*domain.MediaItem, int64, error) {
-	if mediaType != "" && !mediaType.Valid() {
-		return nil, 0, fmt.Errorf("%w: invalid media type %q", domain.ErrInvalidInput, mediaType)
+func (u *MediaUsecase) List(ctx context.Context, userID uuid.UUID, opts domain.MediaListOptions) ([]*domain.MediaItem, int64, error) {
+	if opts.Type != "" && !opts.Type.Valid() {
+		return nil, 0, fmt.Errorf("%w: invalid media type %q", domain.ErrInvalidInput, opts.Type)
 	}
-	if limit < 1 || limit > 200 {
-		limit = 50
+	if !opts.Sort.Valid() {
+		return nil, 0, fmt.Errorf("%w: invalid sort %q", domain.ErrInvalidInput, opts.Sort)
 	}
-	if offset < 0 {
-		offset = 0
+	if opts.Limit < 1 || opts.Limit > 200 {
+		opts.Limit = 50
 	}
-	items, err := u.repo.ListByUserID(ctx, userID, mediaType, limit, offset)
+	if opts.Offset < 0 {
+		opts.Offset = 0
+	}
+	opts.Query = strings.TrimSpace(opts.Query)
+
+	items, err := u.repo.ListByUserID(ctx, userID, opts)
 	if err != nil {
 		return nil, 0, err
 	}
-	total, err := u.repo.CountByUserID(ctx, userID, mediaType)
+	total, err := u.repo.CountByUserID(ctx, userID, opts)
 	if err != nil {
 		return nil, 0, err
 	}
 	return items, total, nil
+}
+
+// Edit applies user-editable fields: a nil pointer leaves the field as is.
+// Renames go through the row Update; the favorite flag has its own atomic
+// repository operation so it can never race with the processing pipeline.
+func (u *MediaUsecase) Edit(ctx context.Context, requesterID uuid.UUID, requesterRole domain.Role, id uuid.UUID, title *string, favorite *bool) (*domain.MediaItem, error) {
+	item, err := u.Get(ctx, requesterID, requesterRole, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if title != nil {
+		trimmed := strings.TrimSpace(*title)
+		if trimmed == "" {
+			return nil, fmt.Errorf("%w: title must not be empty", domain.ErrInvalidInput)
+		}
+		if len(trimmed) > 512 {
+			return nil, fmt.Errorf("%w: title too long (max 512 characters)", domain.ErrInvalidInput)
+		}
+		item.Title = trimmed
+		item.UpdatedAt = time.Now().UTC()
+		if err := u.repo.Update(ctx, item); err != nil {
+			return nil, err
+		}
+	}
+
+	if favorite != nil {
+		if err := u.repo.SetFavorite(ctx, id, *favorite); err != nil {
+			return nil, err
+		}
+		item.IsFavorite = *favorite
+		item.UpdatedAt = time.Now().UTC()
+	}
+
+	return item, nil
 }
 
 // Delete removes the database row and every file derived from the item.

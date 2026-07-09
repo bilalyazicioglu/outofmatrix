@@ -28,9 +28,25 @@ export interface MediaItem {
   blur_hash?: string
   thumbnail_path?: string
   hls_path?: string
+  is_favorite: boolean
+  captured_at?: string
   metadata: MediaMetadata
   created_at: string
   updated_at: string
+}
+
+export type MediaSort = "added" | "name" | "captured"
+
+export interface Collection {
+  id: string
+  user_id: string
+  name: string
+  type: "playlist" | "album"
+  created_at: string
+}
+
+export interface CollectionDetail extends Collection {
+  items: MediaItem[]
 }
 
 export interface User {
@@ -149,9 +165,26 @@ export function register(username: string, password: string) {
 
 // --- Media ------------------------------------------------------------------
 
-export function listMedia(type: MediaType | "", limit: number, offset: number) {
-  const q = new URLSearchParams({ limit: String(limit), offset: String(offset) })
-  if (type) q.set("type", type)
+export interface ListMediaParams {
+  type?: MediaType | ""
+  favorite?: boolean
+  query?: string
+  sort?: MediaSort
+  ascending?: boolean
+  limit: number
+  offset: number
+}
+
+export function listMedia(p: ListMediaParams) {
+  const q = new URLSearchParams({
+    limit: String(p.limit),
+    offset: String(p.offset),
+  })
+  if (p.type) q.set("type", p.type)
+  if (p.favorite) q.set("favorite", "1")
+  if (p.query) q.set("q", p.query)
+  if (p.sort && p.sort !== "added") q.set("sort", p.sort)
+  if (p.ascending) q.set("order", "asc")
   return request<MediaList>(`/media?${q}`)
 }
 
@@ -159,8 +192,52 @@ export function getMedia(id: string) {
   return request<MediaItem>(`/media/${id}`)
 }
 
+export function patchMedia(
+  id: string,
+  body: { title?: string; is_favorite?: boolean }
+) {
+  return request<MediaItem>(`/media/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  })
+}
+
 export function deleteMedia(id: string) {
   return request<void>(`/media/${id}`, { method: "DELETE" })
+}
+
+// --- Albums (collections) -----------------------------------------------------
+
+export function listCollections() {
+  return request<Collection[]>("/collections")
+}
+
+export function createCollection(name: string, type: "album" | "playlist" = "album") {
+  return request<Collection>("/collections", {
+    method: "POST",
+    body: JSON.stringify({ name, type }),
+  })
+}
+
+export function getCollection(id: string) {
+  return request<CollectionDetail>(`/collections/${id}`)
+}
+
+export function deleteCollection(id: string) {
+  return request<void>(`/collections/${id}`, { method: "DELETE" })
+}
+
+export function addToCollection(collectionID: string, mediaID: string) {
+  return request<void>(`/collections/${collectionID}/items`, {
+    method: "POST",
+    body: JSON.stringify({ media_id: mediaID }),
+  })
+}
+
+export function removeFromCollection(collectionID: string, mediaID: string) {
+  return request<void>(`/collections/${collectionID}/items/${mediaID}`, {
+    method: "DELETE",
+  })
 }
 
 // Media elements can't send Authorization headers, so these URLs carry the JWT.

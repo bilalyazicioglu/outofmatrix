@@ -83,6 +83,7 @@ func NewRouter(d RouterDeps) http.Handler {
 
 			private.Get("/media", mediaH.List)
 			private.Get("/media/{id}", mediaH.Get)
+			private.Patch("/media/{id}", mediaH.Patch)
 			private.Delete("/media/{id}", mediaH.Delete)
 
 			private.Get("/media/stream/{id}/{file}", streamH.HLSFile)
